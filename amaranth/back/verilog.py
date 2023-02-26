@@ -8,6 +8,10 @@ from . import rtlil
 __all__ = ["YosysError", "convert", "convert_fragment"]
 
 
+# sim timebase
+TimeUnit='1ns'
+TimePrecision='1ps'
+
 def _convert_rtlil_text(rtlil_text, *, strip_internal_attrs=False, write_verilog_opts=()):
     # this version requirement needs to be synchronized with the one in pyproject.toml!
     yosys = find_yosys(lambda ver: ver >= (0, 10))
@@ -46,4 +50,7 @@ def convert(elaboratable, name="top", platform=None, *, ports, emit_src=True,
             strip_internal_attrs=False, **kwargs):
     fragment = ir.Fragment.get(elaboratable, platform).prepare(ports=ports, **kwargs)
     verilog_text, name_map = convert_fragment(fragment, name, emit_src=emit_src, strip_internal_attrs=strip_internal_attrs)
+    if TimeUnit is not None and TimePrecision is not None:
+        return f"`default_nettype none\n`timescale {TimeUnit}/{TimePrecision}\n{verilog_text}"
+
     return verilog_text
