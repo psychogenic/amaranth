@@ -2,8 +2,10 @@ import warnings
 from enum import Enum
 
 from amaranth.hdl.ast import *
+from amaranth.lib.enum import Enum as AmaranthEnum
 
 from .utils import *
+from amaranth._utils import _ignore_deprecated
 
 
 class UnsignedEnum(Enum):
@@ -46,15 +48,8 @@ class ShapeTestCase(FHDLTestCase):
                 r"^Width must be a non-negative integer, not -1$"):
             Shape(-1)
 
-    def test_compare_wrong(self):
-        with self.assertRaisesRegex(TypeError,
-                r"^Shapes may be compared with shape-castable objects, not 'hi'$"):
-            Shape(1, True) == 'hi'
-
-    def test_compare_tuple_wrong(self):
-        with self.assertRaisesRegex(TypeError,
-                r"^Shapes may be compared with shape-castable objects, not \(2, 3\)$"):
-            Shape(1, True) == (2, 3)
+    def test_compare_non_shape(self):
+        self.assertNotEqual(Shape(1, True), "hi")
 
     def test_repr(self):
         self.assertEqual(repr(Shape()), "unsigned(1)")
@@ -133,7 +128,8 @@ class ShapeTestCase(FHDLTestCase):
 
     def test_cast_enum_bad(self):
         with self.assertRaisesRegex(TypeError,
-                r"^Only enumerations with integer values can be used as value shapes$"):
+                r"^Only enumerations whose members have constant-castable values can be used "
+                r"in Amaranth code$"):
             Shape.cast(StringEnum)
 
     def test_cast_bad(self):
@@ -149,10 +145,11 @@ class MockShapeCastable(ShapeCastable):
     def as_shape(self):
         return self.dest
 
+    def __call__(self, value):
+        return value
 
-class MockShapeCastableNoOverride(ShapeCastable):
-    def __init__(self):
-        pass
+    def const(self, init):
+        return Const(init, self.dest)
 
 
 class ShapeCastableTestCase(FHDLTestCase):
@@ -160,7 +157,9 @@ class ShapeCastableTestCase(FHDLTestCase):
         with self.assertRaisesRegex(TypeError,
                 r"^Class 'MockShapeCastableNoOverride' deriving from `ShapeCastable` must "
                 r"override the `as_shape` method$"):
-            sc = MockShapeCastableNoOverride()
+            class MockShapeCastableNoOverride(ShapeCastable):
+                def __init__(self):
+                    pass
 
     def test_cast(self):
         sc = MockShapeCastable(unsigned(2))
@@ -203,7 +202,8 @@ class ValueTestCase(FHDLTestCase):
 
     def test_cast_enum_wrong(self):
         with self.assertRaisesRegex(TypeError,
-                r"^Only enumerations with integer values can be used as value shapes$"):
+                r"^Only enumerations whose members have constant-castable values can be used "
+                r"in Amaranth code$"):
             Value.cast(StringEnum.FOO)
 
     def test_bool(self):
@@ -361,6 +361,12 @@ class ConstTestCase(FHDLTestCase):
                 r"^Width must be a non-negative integer, not -1$"):
             Const(1, -1)
 
+    def test_wrong_fencepost(self):
+        with self.assertWarnsRegex(SyntaxWarning,
+                r"^Value 10 equals the non-inclusive end of the constant shape "
+                r"range\(0, 10\); this is likely an off-by-one error$"):
+            Const(10, range(10))
+
     def test_normalization(self):
         self.assertEqual(Const(0b10110, signed(5)).value, -10)
 
@@ -396,6 +402,9 @@ class OperatorTestCase(FHDLTestCase):
         v = Const(1, unsigned(4)).as_signed()
         self.assertEqual(repr(v), "(s (const 4'd1))")
         self.assertEqual(v.shape(), signed(4))
+
+    def test_pos(self):
+        self.assertRepr(+Const(10), "(const 4'd10)")
 
     def test_neg(self):
         v1 = -Const(0, unsigned(4))
@@ -594,7 +603,7 @@ class OperatorTestCase(FHDLTestCase):
 
     def test_matches(self):
         s = Signal(4)
-        self.assertRepr(s.matches(), "(const 1'd0)")
+        self.assertRepr(s.matches(), "(const 1'd1)")
         self.assertRepr(s.matches(1), """
         (== (sig s) (const 1'd1))
         """)
@@ -611,7 +620,13 @@ class OperatorTestCase(FHDLTestCase):
     def test_matches_enum(self):
         s = Signal(SignedEnum)
         self.assertRepr(s.matches(SignedEnum.FOO), """
-        (== (sig s) (const 1'sd-1))
+        (== (sig s) (const 2'sd-1))
+        """)
+
+    def test_matches_const_castable(self):
+        s = Signal(4)
+        self.assertRepr(s.matches(Cat(C(0b10, 2), C(0b11, 2))), """
+        (== (sig s) (const 4'd14))
         """)
 
     def test_matches_width_wrong(self):
@@ -620,21 +635,25 @@ class OperatorTestCase(FHDLTestCase):
                 r"^Match pattern '--' must have the same width as match value \(which is 4\)$"):
             s.matches("--")
         with self.assertWarnsRegex(SyntaxWarning,
-                (r"^Match pattern '10110' is wider than match value \(which has width 4\); "
-                    r"comparison will never be true$")):
+                r"^Match pattern '22' \(5'10110\) is wider than match value \(which has "
+                r"width 4\); comparison will never be true$"):
             s.matches(0b10110)
+        with self.assertWarnsRegex(SyntaxWarning,
+                r"^Match pattern '\(cat \(const 1'd0\) \(const 4'd11\)\)' \(5'10110\) is wider "
+                r"than match value \(which has width 4\); comparison will never be true$"):
+            s.matches(Cat(0, C(0b1011, 4)))
 
     def test_matches_bits_wrong(self):
         s = Signal(4)
         with self.assertRaisesRegex(SyntaxError,
-                (r"^Match pattern 'abc' must consist of 0, 1, and - \(don't care\) bits, "
-                    r"and may include whitespace$")):
+                r"^Match pattern 'abc' must consist of 0, 1, and - \(don't care\) bits, "
+                r"and may include whitespace$"):
             s.matches("abc")
 
     def test_matches_pattern_wrong(self):
         s = Signal(4)
         with self.assertRaisesRegex(SyntaxError,
-                r"^Match pattern must be an integer, a string, or an enumeration, not 1\.0$"):
+                r"^Match pattern must be a string or a constant-castable expression, not 1\.0$"):
             s.matches(1.0)
 
     def test_hash(self):
@@ -783,28 +802,34 @@ class CatTestCase(FHDLTestCase):
             warnings.filterwarnings(action="error", category=SyntaxWarning)
             Cat(0, 1, 1, 0)
 
-    def test_enum(self):
+    def test_enum_wrong(self):
         class Color(Enum):
             RED  = 1
             BLUE = 2
-        with warnings.catch_warnings():
-            warnings.filterwarnings(action="error", category=SyntaxWarning)
+        with self.assertWarnsRegex(SyntaxWarning,
+                r"^Argument #1 of Cat\(\) is an enumerated value <Color\.RED: 1> without "
+                r"a defined shape used in bit vector context; define the enumeration by "
+                r"inheriting from the class in amaranth\.lib\.enum and specifying "
+                r"the 'shape=' keyword argument$"):
             c = Cat(Color.RED, Color.BLUE)
         self.assertEqual(repr(c), "(cat (const 2'd1) (const 2'd2))")
 
-    def test_intenum(self):
+    def test_intenum_wrong(self):
         class Color(int, Enum):
             RED  = 1
             BLUE = 2
-        with warnings.catch_warnings():
-            warnings.filterwarnings(action="error", category=SyntaxWarning)
+        with self.assertWarnsRegex(SyntaxWarning,
+                r"^Argument #1 of Cat\(\) is an enumerated value <Color\.RED: 1> without "
+                r"a defined shape used in bit vector context; define the enumeration by "
+                r"inheriting from the class in amaranth\.lib\.enum and specifying "
+                r"the 'shape=' keyword argument$"):
             c = Cat(Color.RED, Color.BLUE)
         self.assertEqual(repr(c), "(cat (const 2'd1) (const 2'd2))")
 
     def test_int_wrong(self):
         with self.assertWarnsRegex(SyntaxWarning,
                 r"^Argument #1 of Cat\(\) is a bare integer 2 used in bit vector context; "
-                r"consider specifying explicit width using C\(2, 2\) instead$"):
+                r"specify the width explicitly using C\(2, 2\)$"):
             Cat(2)
 
 
@@ -946,8 +971,10 @@ class SignalTestCase(FHDLTestCase):
         self.assertEqual(s8.shape(), signed(5))
         s9 = Signal(range(-20, 16))
         self.assertEqual(s9.shape(), signed(6))
-        s10 = Signal(range(0))
-        self.assertEqual(s10.shape(), unsigned(0))
+        with warnings.catch_warnings():
+            warnings.filterwarnings(action="ignore", category=SyntaxWarning)
+            s10 = Signal(range(0))
+            self.assertEqual(s10.shape(), unsigned(0))
         s11 = Signal(range(1))
         self.assertEqual(s11.shape(), unsigned(1))
 
@@ -971,20 +998,57 @@ class SignalTestCase(FHDLTestCase):
         s1 = Signal(2, reset=UnsignedEnum.BAR)
         self.assertEqual(s1.reset, 2)
         with self.assertRaisesRegex(TypeError,
-                r"^Reset value has to be an int or an integral Enum$"
-        ):
+                r"^Reset value must be a constant-castable expression, "
+                r"not <StringEnum\.FOO: 'a'>$"):
             Signal(1, reset=StringEnum.FOO)
 
-    def test_reset_narrow(self):
+    def test_reset_shape_castable_const(self):
+        class CastableFromHex(ShapeCastable):
+            def as_shape(self):
+                return unsigned(8)
+
+            def __call__(self, value):
+                return value
+
+            def const(self, init):
+                return int(init, 16)
+
+        s1 = Signal(CastableFromHex(), reset="aa")
+        self.assertEqual(s1.reset, 0xaa)
+
+        with self.assertRaisesRegex(ValueError,
+                r"^Constant returned by <.+?CastableFromHex.+?>\.const\(\) must have the shape "
+                r"that it casts to, unsigned\(8\), and not unsigned\(1\)$"):
+            Signal(CastableFromHex(), reset="01")
+
+    def test_reset_shape_castable_enum_wrong(self):
+        class EnumA(AmaranthEnum):
+            X = 1
+        with self.assertRaisesRegex(TypeError,
+                r"^Reset value must be a constant initializer of <enum 'EnumA'>$"):
+            Signal(EnumA) # implied reset=0
+
+    def test_reset_signed_mismatch(self):
         with self.assertWarnsRegex(SyntaxWarning,
-                r"^Reset value 8 requires 4 bits to represent, but the signal only has 3 bits$"):
-            Signal(3, reset=8)
+                r"^Reset value -2 is signed, but the signal shape is unsigned\(2\)$"):
+            Signal(unsigned(2), reset=-2)
+
+    def test_reset_wrong_too_wide(self):
         with self.assertWarnsRegex(SyntaxWarning,
-                r"^Reset value 4 requires 4 bits to represent, but the signal only has 3 bits$"):
-            Signal(signed(3), reset=4)
+                r"^Reset value 2 will be truncated to the signal shape unsigned\(1\)$"):
+            Signal(unsigned(1), reset=2)
         with self.assertWarnsRegex(SyntaxWarning,
-                r"^Reset value -5 requires 4 bits to represent, but the signal only has 3 bits$"):
-            Signal(signed(3), reset=-5)
+                r"^Reset value 1 will be truncated to the signal shape signed\(1\)$"):
+            Signal(signed(1), reset=1)
+        with self.assertWarnsRegex(SyntaxWarning,
+                r"^Reset value -2 will be truncated to the signal shape signed\(1\)$"):
+            Signal(signed(1), reset=-2)
+
+    def test_reset_wrong_fencepost(self):
+        with self.assertWarnsRegex(SyntaxWarning,
+                r"^Reset value 10 equals the non-inclusive end of the signal shape "
+                r"range\(0, 10\); this is likely an off-by-one error$"):
+            Signal(range(0, 10), reset=10)
 
     def test_attrs(self):
         s1 = Signal()
@@ -1101,19 +1165,6 @@ class MockValueCastableChanges(ValueCastable):
         return Signal(self.width)
 
 
-class MockValueCastableNotDecorated(ValueCastable):
-    def __init__(self):
-        pass
-
-    def as_value(self):
-        return Signal()
-
-
-class MockValueCastableNoOverride(ValueCastable):
-    def __init__(self):
-        pass
-
-
 class MockValueCastableCustomGetattr(ValueCastable):
     def __init__(self):
         pass
@@ -1131,13 +1182,20 @@ class ValueCastableTestCase(FHDLTestCase):
         with self.assertRaisesRegex(TypeError,
                 r"^Class 'MockValueCastableNotDecorated' deriving from `ValueCastable` must "
                 r"decorate the `as_value` method with the `ValueCastable.lowermethod` decorator$"):
-            vc = MockValueCastableNotDecorated()
+            class MockValueCastableNotDecorated(ValueCastable):
+                def __init__(self):
+                    pass
+
+                def as_value(self):
+                    return Signal()
 
     def test_no_override(self):
         with self.assertRaisesRegex(TypeError,
                 r"^Class 'MockValueCastableNoOverride' deriving from `ValueCastable` must "
                 r"override the `as_value` method$"):
-            vc = MockValueCastableNoOverride()
+            class MockValueCastableNoOverride(ValueCastable):
+                def __init__(self):
+                    pass
 
     def test_memoized(self):
         vc = MockValueCastableChanges(1)
@@ -1166,27 +1224,32 @@ class ValueCastableTestCase(FHDLTestCase):
 
 
 class SampleTestCase(FHDLTestCase):
+    @_ignore_deprecated
     def test_const(self):
         s = Sample(1, 1, "sync")
         self.assertEqual(s.shape(), unsigned(1))
 
+    @_ignore_deprecated
     def test_signal(self):
         s1 = Sample(Signal(2), 1, "sync")
         self.assertEqual(s1.shape(), unsigned(2))
         s2 = Sample(ClockSignal(), 1, "sync")
         s3 = Sample(ResetSignal(), 1, "sync")
 
+    @_ignore_deprecated
     def test_wrong_value_operator(self):
         with self.assertRaisesRegex(TypeError,
                 (r"^Sampled value must be a signal or a constant, not "
                 r"\(\+ \(sig \$signal\) \(const 1'd1\)\)$")):
             Sample(Signal() + 1, 1, "sync")
 
+    @_ignore_deprecated
     def test_wrong_clocks_neg(self):
         with self.assertRaisesRegex(ValueError,
                 r"^Cannot sample a value 1 cycles in the future$"):
             Sample(Signal(), -1, "sync")
 
+    @_ignore_deprecated
     def test_wrong_domain(self):
         with self.assertRaisesRegex(TypeError,
                 r"^Domain name must be a string or None, not 0$"):

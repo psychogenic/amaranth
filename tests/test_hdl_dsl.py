@@ -1,13 +1,14 @@
 # amaranth: UnusedElaboratable=no
 
 from collections import OrderedDict
-from enum import Enum
 
 from amaranth.hdl.ast import *
 from amaranth.hdl.cd import *
 from amaranth.hdl.dsl import *
+from amaranth.lib.enum import Enum
 
 from .utils import *
+from amaranth._utils import _ignore_deprecated
 
 
 class DSLTestCase(FHDLTestCase):
@@ -131,6 +132,7 @@ class DSLTestCase(FHDLTestCase):
         )
         """)
 
+    @_ignore_deprecated
     def test_sample_domain(self):
         m = Module()
         i = Signal()
@@ -434,7 +436,7 @@ class DSLTestCase(FHDLTestCase):
             RED  = 1
             BLUE = 2
         m = Module()
-        se = Signal(Color)
+        se = Signal(Color, reset=Color.RED)
         with m.Switch(se):
             with m.Case(Color.RED):
                 m.d.comb += self.c1.eq(1)
@@ -442,6 +444,23 @@ class DSLTestCase(FHDLTestCase):
         (
             (switch (sig se)
                 (case 01 (eq (sig c1) (const 1'd1)))
+            )
+        )
+        """)
+
+    def test_Switch_const_castable(self):
+        class Color(Enum, shape=1):
+            RED  = 0
+            BLUE = 1
+        m = Module()
+        se = Signal(2)
+        with m.Switch(se):
+            with m.Case(Cat(Color.RED, Color.BLUE)):
+                m.d.comb += self.c1.eq(1)
+        self.assertRepr(m._statements, """
+        (
+            (switch (sig se)
+                (case 10 (eq (sig c1) (const 1'd1)))
             )
         )
         """)
@@ -456,13 +475,13 @@ class DSLTestCase(FHDLTestCase):
                 with m.Case("--"):
                     pass
             with self.assertWarnsRegex(SyntaxWarning,
-                    (r"^Case pattern '10110' is wider than switch value \(which has width 4\); "
-                        r"comparison will never be true$")):
+                    r"^Case pattern '22' \(5'10110\) is wider than switch value \(which has "
+                    r"width 4\); comparison will never be true$"):
                 with m.Case(0b10110):
                     pass
             with self.assertWarnsRegex(SyntaxWarning,
-                    (r"^Case pattern '10101010' \(Color\.RED\) is wider than switch value "
-                        r"\(which has width 4\); comparison will never be true$")):
+                    r"^Case pattern '<Color.RED: 170>' \(8'10101010\) is wider than switch value "
+                    r"\(which has width 4\); comparison will never be true$"):
                 with m.Case(Color.RED):
                     pass
         self.assertRepr(m._statements, """
@@ -484,7 +503,8 @@ class DSLTestCase(FHDLTestCase):
         m = Module()
         with m.Switch(self.w1):
             with self.assertRaisesRegex(SyntaxError,
-                    r"^Case pattern must be an integer, a string, or an enumeration, not 1\.0$"):
+                    r"^Case pattern must be a string or a constant-castable expression, "
+                    r"not 1\.0$"):
                 with m.Case(1.0):
                     pass
 

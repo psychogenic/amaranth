@@ -1,4 +1,5 @@
 from abc import ABCMeta, abstractmethod
+import inspect
 import warnings
 import functools
 from collections import OrderedDict
@@ -8,6 +9,7 @@ from itertools import chain
 
 from .. import tracer
 from .._utils import *
+from .._utils import _ignore_deprecated
 from .._unused import *
 
 
@@ -40,12 +42,16 @@ class ShapeCastable:
     a richer description of the shape than what is supported by the core Amaranth language, yet
     still be transparently used with it.
     """
-    def __new__(cls, *args, **kwargs):
-        self = super().__new__(cls)
-        if not hasattr(self, "as_shape"):
+    def __init_subclass__(cls, **kwargs):
+        if not hasattr(cls, "as_shape"):
             raise TypeError(f"Class '{cls.__name__}' deriving from `ShapeCastable` must override "
                             f"the `as_shape` method")
-        return self
+        if not (hasattr(cls, "__call__") and inspect.isfunction(cls.__call__)):
+            raise TypeError(f"Class '{cls.__name__}' deriving from `ShapeCastable` must override "
+                            f"the `__call__` method")
+        if not hasattr(cls, "const"):
+            raise TypeError(f"Class '{cls.__name__}' deriving from `ShapeCastable` must override "
+                            f"the `const` method")
 
 
 class Shape:
@@ -78,11 +84,34 @@ class Shape:
         self.width = width
         self.signed = signed
 
+    # The algorithm for inferring shape for standard Python enumerations is factored out so that
+    # `Shape.cast()` and Amaranth's `EnumMeta.as_shape()` can both use it.
+    @staticmethod
+    def _cast_plain_enum(obj):
+        signed = False
+        width  = 0
+        for member in obj:
+            try:
+                member_shape = Const.cast(member.value).shape()
+            except TypeError as e:
+                raise TypeError("Only enumerations whose members have constant-castable "
+                                "values can be used in Amaranth code")
+            if not signed and member_shape.signed:
+                signed = True
+                width  = max(width + 1, member_shape.width)
+            elif signed and not member_shape.signed:
+                width  = max(width, member_shape.width + 1)
+            else:
+                width  = max(width, member_shape.width)
+        return Shape(width, signed)
+
     @staticmethod
     def cast(obj, *, src_loc_at=0):
         while True:
             if isinstance(obj, Shape):
                 return obj
+            elif isinstance(obj, ShapeCastable):
+                new_obj = obj.as_shape()
             elif isinstance(obj, int):
                 return Shape(obj)
             elif isinstance(obj, range):
@@ -93,16 +122,9 @@ class Shape:
                              bits_for(obj.stop - obj.step, signed))
                 return Shape(width, signed)
             elif isinstance(obj, type) and issubclass(obj, Enum):
-                min_value = min(member.value for member in obj)
-                max_value = max(member.value for member in obj)
-                if not isinstance(min_value, int) or not isinstance(max_value, int):
-                    raise TypeError("Only enumerations with integer values can be used "
-                                    "as value shapes")
-                signed = min_value < 0 or max_value < 0
-                width  = max(bits_for(min_value, signed), bits_for(max_value, signed))
-                return Shape(width, signed)
-            elif isinstance(obj, ShapeCastable):
-                new_obj = obj.as_shape()
+                # For compatibility with third party enumerations, handle them as if they were
+                # defined as subclasses of lib.enum.Enum with no explicitly specified shape.
+                return Shape._cast_plain_enum(obj)
             else:
                 raise TypeError("Object {!r} cannot be converted to an Amaranth shape".format(obj))
             if new_obj is obj:
@@ -116,13 +138,8 @@ class Shape:
             return "unsigned({})".format(self.width)
 
     def __eq__(self, other):
-        if not isinstance(other, Shape):
-            try:
-                other = self.__class__.cast(other)
-            except TypeError as e:
-                raise TypeError("Shapes may be compared with shape-castable objects, not {!r}"
-                                .format(other)) from e
-        return self.width == other.width and self.signed == other.signed
+        return (isinstance(other, Shape) and
+                self.width == other.width and self.signed == other.signed)
 
 
 def unsigned(width):
@@ -165,6 +182,9 @@ class Value(metaclass=ABCMeta):
 
     def __bool__(self):
         raise TypeError("Attempted to convert Amaranth value to Python boolean")
+
+    def __pos__(self):
+        return self
 
     def __invert__(self):
         return Operator("~", [self])
@@ -399,11 +419,8 @@ class Value(metaclass=ABCMeta):
             ``1`` if any pattern matches the value, ``0`` otherwise.
         """
         matches = []
+        # This code should accept exactly the same patterns as `with m.Case(...):`.
         for pattern in patterns:
-            if not isinstance(pattern, (int, str, Enum)):
-                raise SyntaxError("Match pattern must be an integer, a string, or an enumeration, "
-                                  "not {!r}"
-                                  .format(pattern))
             if isinstance(pattern, str) and any(bit not in "01- \t" for bit in pattern):
                 raise SyntaxError("Match pattern '{}' must consist of 0, 1, and - (don't care) "
                                   "bits, and may include whitespace"
@@ -413,25 +430,28 @@ class Value(metaclass=ABCMeta):
                 raise SyntaxError("Match pattern '{}' must have the same width as match value "
                                   "(which is {})"
                                   .format(pattern, len(self)))
-            if isinstance(pattern, int) and bits_for(pattern) > len(self):
-                warnings.warn("Match pattern '{:b}' is wider than match value "
-                              "(which has width {}); comparison will never be true"
-                              .format(pattern, len(self)),
-                              SyntaxWarning, stacklevel=3)
-                continue
             if isinstance(pattern, str):
                 pattern = "".join(pattern.split()) # remove whitespace
                 mask    = int(pattern.replace("0", "1").replace("-", "0"), 2)
                 pattern = int(pattern.replace("-", "0"), 2)
                 matches.append((self & mask) == pattern)
-            elif isinstance(pattern, int):
-                matches.append(self == pattern)
-            elif isinstance(pattern, Enum):
-                matches.append(self == pattern.value)
             else:
-                assert False
+                try:
+                    orig_pattern, pattern = pattern, Const.cast(pattern)
+                except TypeError as e:
+                    raise SyntaxError("Match pattern must be a string or a constant-castable "
+                                      "expression, not {!r}"
+                                      .format(pattern)) from e
+                pattern_len = bits_for(pattern.value)
+                if pattern_len > len(self):
+                    warnings.warn("Match pattern '{!r}' ({}'{:b}) is wider than match value "
+                                  "(which has width {}); comparison will never be true"
+                                  .format(orig_pattern, pattern_len, pattern.value, len(self)),
+                                  SyntaxWarning, stacklevel=2)
+                    continue
+                matches.append(self == pattern)
         if not matches:
-            return Const(0)
+            return Const(1)
         elif len(matches) == 1:
             return matches[0]
         else:
@@ -557,11 +577,6 @@ class Value(metaclass=ABCMeta):
     def _rhs_signals(self):
         pass # :nocov:
 
-    def _as_const(self):
-        raise TypeError("Value {!r} cannot be evaluated as constant".format(self))
-
-    __hash__ = None
-
 
 @final
 class Const(Value):
@@ -582,13 +597,37 @@ class Const(Value):
     """
     src_loc = None
 
+    # TODO(amaranth-0.5): remove
     @staticmethod
+    @deprecated("instead of `Const.normalize(value, shape)`, use `Const(value, shape).value`")
     def normalize(value, shape):
         mask = (1 << shape.width) - 1
         value &= mask
         if shape.signed and value >> (shape.width - 1):
             value |= ~mask
         return value
+
+    @staticmethod
+    def cast(obj):
+        """Converts ``obj`` to an Amaranth constant.
+
+        First, ``obj`` is converted to a value using :meth:`Value.cast`. If it is a constant, it
+        is returned. If it is a constant-castable expression, it is evaluated and returned.
+        Otherwise, :exn:`TypeError` is raised.
+        """
+        obj = Value.cast(obj)
+        if type(obj) is Const:
+            return obj
+        elif type(obj) is Cat:
+            value = 0
+            width = 0
+            for part in obj.parts:
+                const  = Const.cast(part)
+                value |= const.value << width
+                width += len(const)
+            return Const(value, width)
+        else:
+            raise TypeError("Value {!r} cannot be converted to an Amaranth constant".format(obj))
 
     def __init__(self, value, shape=None, *, src_loc_at=0):
         # We deliberately do not call Value.__init__ here.
@@ -598,19 +637,26 @@ class Const(Value):
         elif isinstance(shape, int):
             shape = Shape(shape, signed=self.value < 0)
         else:
+            if isinstance(shape, range) and self.value == shape.stop:
+                warnings.warn(
+                    message="Value {!r} equals the non-inclusive end of the constant "
+                            "shape {!r}; this is likely an off-by-one error"
+                            .format(self.value, shape),
+                    category=SyntaxWarning,
+                    stacklevel=2)
             shape = Shape.cast(shape, src_loc_at=1 + src_loc_at)
         self.width  = shape.width
         self.signed = shape.signed
-        self.value  = self.normalize(self.value, shape)
+        if self.signed and self.value >> (self.width - 1):
+            self.value |= -(1 << self.width)
+        else:
+            self.value &= (1 << self.width) - 1
 
     def shape(self):
         return Shape(self.width, self.signed)
 
     def _rhs_signals(self):
         return SignalSet()
-
-    def _as_const(self):
-        return self.value
 
     def __repr__(self):
         return "(const {}'{}d{})".format(self.width, "s" if self.signed else "", self.value)
@@ -834,9 +880,17 @@ class Cat(Value):
         super().__init__(src_loc_at=src_loc_at)
         self.parts = []
         for index, arg in enumerate(flatten(args)):
+            if isinstance(arg, Enum) and (not isinstance(type(arg), ShapeCastable) or
+                                          not hasattr(arg, "_amaranth_shape_")):
+                warnings.warn("Argument #{} of Cat() is an enumerated value {!r} without "
+                              "a defined shape used in bit vector context; define the enumeration "
+                              "by inheriting from the class in amaranth.lib.enum and specifying "
+                              "the 'shape=' keyword argument"
+                              .format(index + 1, arg),
+                              SyntaxWarning, stacklevel=2 + src_loc_at)
             if isinstance(arg, int) and not isinstance(arg, Enum) and arg not in [0, 1]:
                 warnings.warn("Argument #{} of Cat() is a bare integer {} used in bit vector "
-                              "context; consider specifying explicit width using C({}, {}) instead"
+                              "context; specify the width explicitly using C({}, {})"
                               .format(index + 1, arg, arg, bits_for(arg)),
                               SyntaxWarning, stacklevel=2 + src_loc_at)
             self.parts.append(Value.cast(arg))
@@ -849,13 +903,6 @@ class Cat(Value):
 
     def _rhs_signals(self):
         return union((part._rhs_signals() for part in self.parts), start=SignalSet())
-
-    def _as_const(self):
-        value = 0
-        for part in reversed(self.parts):
-            value <<= len(part)
-            value |= part._as_const()
-        return value
 
     def __repr__(self):
         return "(cat {})".format(" ".join(map(repr, self.parts)))
@@ -906,8 +953,16 @@ class Repl(Value):
         return "(repl {!r} {})".format(self.value, self.count)
 
 
+class _SignalMeta(ABCMeta):
+    def __call__(cls, shape=None, src_loc_at=0, **kwargs):
+        signal = super().__call__(shape, **kwargs, src_loc_at=src_loc_at + 1)
+        if isinstance(shape, ShapeCastable):
+            return shape(signal)
+        return signal
+
+
 # @final
-class Signal(Value, DUID):
+class Signal(Value, DUID, metaclass=_SignalMeta):
     """A varying integer value.
 
     Parameters
@@ -948,7 +1003,7 @@ class Signal(Value, DUID):
     decoder : function
     """
 
-    def __init__(self, shape=None, *, name=None, reset=0, reset_less=False,
+    def __init__(self, shape=None, *, name=None, reset=None, reset_less=False,
                  attrs=None, decoder=None, src_loc_at=0):
         super().__init__(src_loc_at=src_loc_at)
 
@@ -964,20 +1019,49 @@ class Signal(Value, DUID):
         self.width  = shape.width
         self.signed = shape.signed
 
-        if isinstance(reset, Enum):
-            reset = reset.value
-        if not isinstance(reset, int):
-            raise TypeError("Reset value has to be an int or an integral Enum")
-
-        reset_width = bits_for(reset, self.signed)
-        if reset != 0 and reset_width > self.width:
-            warnings.warn("Reset value {!r} requires {} bits to represent, but the signal "
-                          "only has {} bits"
-                          .format(reset, reset_width, self.width),
-                          SyntaxWarning, stacklevel=2 + src_loc_at)
-
-        self.reset = reset
+        orig_reset = reset
+        if isinstance(orig_shape, ShapeCastable):
+            try:
+                reset = Const.cast(orig_shape.const(reset))
+            except Exception:
+                raise TypeError("Reset value must be a constant initializer of {!r}"
+                                .format(orig_shape))
+            if reset.shape() != Shape.cast(orig_shape):
+                raise ValueError("Constant returned by {!r}.const() must have the shape that "
+                                 "it casts to, {!r}, and not {!r}"
+                                 .format(orig_shape, Shape.cast(orig_shape),
+                                         reset.shape()))
+        else:
+            try:
+                reset = Const.cast(reset or 0)
+            except TypeError:
+                raise TypeError("Reset value must be a constant-castable expression, not {!r}"
+                                .format(orig_reset))
+        if orig_reset not in (None, 0, -1): # Avoid false positives for all-zeroes and all-ones
+            if reset.shape().signed and not self.signed:
+                warnings.warn(
+                    message="Reset value {!r} is signed, but the signal shape is {!r}"
+                            .format(orig_reset, shape),
+                    category=SyntaxWarning,
+                    stacklevel=2)
+            elif (reset.shape().width > self.width or
+                  reset.shape().width == self.width and
+                    self.signed and not reset.shape().signed):
+                warnings.warn(
+                    message="Reset value {!r} will be truncated to the signal shape {!r}"
+                            .format(orig_reset, shape),
+                    category=SyntaxWarning,
+                    stacklevel=2)
+        self.reset = reset.value
         self.reset_less = bool(reset_less)
+
+        if isinstance(orig_shape, range) and self.reset == orig_shape.stop:
+            warnings.warn(
+                message="Reset value {!r} equals the non-inclusive end of the signal "
+                        "shape {!r}; this is likely an off-by-one error"
+                        .format(self.reset, orig_shape),
+                category=SyntaxWarning,
+                stacklevel=2)
 
         self.attrs = OrderedDict(() if attrs is None else attrs)
 
@@ -1260,15 +1344,13 @@ class ValueCastable:
     from :class:`ValueCastable` is mutable, it is up to the user to ensure that it is not mutated
     in a way that changes its representation after the first call to :meth:`as_value`.
     """
-    def __new__(cls, *args, **kwargs):
-        self = super().__new__(cls)
-        if not hasattr(self, "as_value"):
+    def __init_subclass__(cls, **kwargs):
+        if not hasattr(cls, "as_value"):
             raise TypeError(f"Class '{cls.__name__}' deriving from `ValueCastable` must override "
                             "the `as_value` method")
-        if not hasattr(self.as_value, "_ValueCastable__memoized"):
+        if not hasattr(cls.as_value, "_ValueCastable__memoized"):
             raise TypeError(f"Class '{cls.__name__}' deriving from `ValueCastable` must decorate "
                             "the `as_value` method with the `ValueCastable.lowermethod` decorator")
-        return self
 
     @staticmethod
     def lowermethod(func):
@@ -1292,6 +1374,7 @@ class ValueCastable:
         return wrapper_memoized
 
 
+# TODO(amaranth-0.5): remove
 @final
 class Sample(Value):
     """Value from the past.
@@ -1300,6 +1383,7 @@ class Sample(Value):
     of the ``domain`` clock back. If that moment is before the beginning of time, it is equal
     to the value of the expression calculated as if each signal had its reset value.
     """
+    @deprecated("instead of using `Sample`, create a register explicitly")
     def __init__(self, expr, clocks, domain, *, src_loc_at=0):
         super().__init__(src_loc_at=1 + src_loc_at)
         self.value  = Value.cast(expr)
@@ -1326,20 +1410,32 @@ class Sample(Value):
             self.value, "<default>" if self.domain is None else self.domain, self.clocks)
 
 
+# TODO(amaranth-0.5): remove
+@deprecated("instead of using `Past`, create a register explicitly")
 def Past(expr, clocks=1, domain=None):
-    return Sample(expr, clocks, domain)
+    with _ignore_deprecated():
+        return Sample(expr, clocks, domain)
 
 
+# TODO(amaranth-0.5): remove
+@deprecated("instead of using `Stable`, create registers and comparisons explicitly")
 def Stable(expr, clocks=0, domain=None):
-    return Sample(expr, clocks + 1, domain) == Sample(expr, clocks, domain)
+    with _ignore_deprecated():
+        return Sample(expr, clocks + 1, domain) == Sample(expr, clocks, domain)
 
 
+# TODO(amaranth-0.5): remove
+@deprecated("instead of using `Rose`, create registers and comparisons explicitly")
 def Rose(expr, clocks=0, domain=None):
-    return ~Sample(expr, clocks + 1, domain) & Sample(expr, clocks, domain)
+    with _ignore_deprecated():
+        return ~Sample(expr, clocks + 1, domain) & Sample(expr, clocks, domain)
 
 
+# TODO(amaranth-0.5): remove
+@deprecated("instead of using `Fell`, create registers and comparisons explicitly")
 def Fell(expr, clocks=0, domain=None):
-    return Sample(expr, clocks + 1, domain) & ~Sample(expr, clocks, domain)
+    with _ignore_deprecated():
+        return Sample(expr, clocks + 1, domain) & ~Sample(expr, clocks, domain)
 
 
 @final

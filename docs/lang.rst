@@ -34,6 +34,43 @@ All of the examples below assume that a glob import is used.
    from amaranth import *
 
 
+.. _lang-shapes:
+
+Shapes
+======
+
+A ``Shape`` is an object with two attributes, ``.width`` and ``.signed``. It can be constructed directly:
+
+.. doctest::
+
+   >>> Shape(width=5, signed=False)
+   unsigned(5)
+   >>> Shape(width=12, signed=True)
+   signed(12)
+
+However, in most cases, the shape is always constructed with the same signedness, and the aliases ``signed`` and ``unsigned`` are more convenient:
+
+.. doctest::
+
+   >>> unsigned(5) == Shape(width=5, signed=False)
+   True
+   >>> signed(12) == Shape(width=12, signed=True)
+   True
+
+
+Shapes of values
+----------------
+
+All values have a ``.shape()`` method that computes their shape. The width of a value ``v``, ``v.shape().width``, can also be retrieved with ``len(v)``.
+
+.. doctest::
+
+   >>> Const(5).shape()
+   unsigned(3)
+   >>> len(Const(5))
+   3
+
+
 .. _lang-values:
 
 Values
@@ -77,43 +114,6 @@ The shape of the constant can be specified explicitly, in which case the number'
    -127
    >>> Const(1, unsigned(0)).value
    0
-
-
-.. _lang-shapes:
-
-Shapes
-======
-
-A ``Shape`` is an object with two attributes, ``.width`` and ``.signed``. It can be constructed directly:
-
-.. doctest::
-
-   >>> Shape(width=5, signed=False)
-   unsigned(5)
-   >>> Shape(width=12, signed=True)
-   signed(12)
-
-However, in most cases, the shape is always constructed with the same signedness, and the aliases ``signed`` and ``unsigned`` are more convenient:
-
-.. doctest::
-
-   >>> unsigned(5) == Shape(width=5, signed=False)
-   True
-   >>> signed(12) == Shape(width=12, signed=True)
-   True
-
-
-Shapes of values
-----------------
-
-All values have a ``.shape()`` method that computes their shape. The width of a value ``v``, ``v.shape().width``, can also be retrieved with ``len(v)``.
-
-.. doctest::
-
-   >>> Const(5).shape()
-   unsigned(3)
-   >>> len(Const(5))
-   3
 
 
 .. _lang-shapecasting:
@@ -163,7 +163,7 @@ Specifying a shape with a range is convenient for counters, indexes, and all oth
 
 .. _lang-exclrange:
 
-.. warning::
+.. note::
 
    Python ranges are *exclusive* or *half-open*, meaning they do not contain their ``.stop`` element. Because of this, values with shapes cast from a ``range(stop)`` where ``stop`` is a power of 2 are not wide enough to represent ``stop`` itself:
 
@@ -175,7 +175,7 @@ Specifying a shape with a range is convenient for counters, indexes, and all oth
       >>> fencepost.value
       0
 
-   Be mindful of this edge case!
+   Amaranth detects uses of :class:`Const` and :class:`Signal` that invoke such an off-by-one error, and emits a diagnostic message.
 
 
 .. _lang-shapeenum:
@@ -183,11 +183,7 @@ Specifying a shape with a range is convenient for counters, indexes, and all oth
 Shapes from enumerations
 ------------------------
 
-Casting a shape from an :class:`enum.Enum` subclass ``E``:
-
-  * fails if any of the enumeration members have non-integer values,
-  * has a width large enough to represent both ``min(m.value for m in E)`` and ``max(m.value for m in E)``, and
-  * is signed if either ``min(m.value for m in E)`` or ``max(m.value for m in E)`` are negative, unsigned otherwise.
+Casting a shape from an :class:`enum.Enum` subclass requires all of the enumeration members to have :ref:`constant-castable <lang-constcasting>` values. The shape has a width large enough to represent the value of every member, and is signed only if there is a member with a negative value.
 
 Specifying a shape with an enumeration is convenient for finite state machines, multiplexers, complex control signals, and all other values whose width is derived from a few distinct choices they must be able to fit:
 
@@ -208,9 +204,27 @@ Specifying a shape with an enumeration is convenient for finite state machines, 
    >>> Shape.cast(Direction)
    unsigned(2)
 
+The :mod:`amaranth.lib.enum` module extends the standard enumerations such that their shape can be specified explicitly when they are defined:
+
+.. testsetup::
+
+   import amaranth.lib.enum
+
+.. testcode::
+
+   class Funct4(amaranth.lib.enum.Enum, shape=unsigned(4)):
+       ADD = 0
+       SUB = 1
+       MUL = 2
+
+.. doctest::
+
+   >>> Shape.cast(Funct4)
+   unsigned(4)
+
 .. note::
 
-   The enumeration does not have to subclass :class:`enum.IntEnum`; it only needs to have integers as values of every member. Using enumerations based on :class:`enum.Enum` rather than :class:`enum.IntEnum` prevents unwanted implicit conversion of enum members to integers.
+   The enumeration does not have to subclass :class:`enum.IntEnum` or have :class:`int` as one of its base classes; it only needs to have integers as values of every member. Using enumerations based on :class:`enum.Enum` rather than :class:`enum.IntEnum` prevents unwanted implicit conversion of enum members to integers.
 
 
 .. _lang-valuecasting:
@@ -218,7 +232,7 @@ Specifying a shape with an enumeration is convenient for finite state machines, 
 Value casting
 =============
 
-Like shapes, values may be *cast* from other objects, which are called *value-castable*. Casting allows objects that are not provided by Amaranth, such as integers or enumeration members, to be used in Amaranth expressions directly.
+Like shapes, values may be *cast* from other objects, which are called *value-castable*. Casting to values allows objects that are not provided by Amaranth, such as integers or enumeration members, to be used in Amaranth expressions directly.
 
 .. TODO: link to ValueCastable
 
@@ -228,7 +242,7 @@ Casting to a value can be done explicitly with ``Value.cast``, but is usually im
 Values from integers
 --------------------
 
-Casting a value from an integer ``i`` is a shorthand for ``Const(i)``:
+Casting a value from an integer ``i`` is equivalent to ``Const(i)``:
 
 .. doctest::
 
@@ -242,7 +256,7 @@ Casting a value from an integer ``i`` is a shorthand for ``Const(i)``:
 Values from enumeration members
 -------------------------------
 
-Casting a value from an enumeration member ``m`` is a shorthand for ``Const(m.value, type(m))``:
+Casting a value from an enumeration member ``m`` is equivalent to ``Const(m.value, type(m))``:
 
 .. doctest::
 
@@ -253,6 +267,50 @@ Casting a value from an enumeration member ``m`` is a shorthand for ``Const(m.va
 .. note::
 
    If a value subclasses :class:`enum.IntEnum` or its class otherwise inherits from both :class:`int` and :class:`Enum`, it is treated as an enumeration.
+
+
+.. _lang-constcasting:
+
+Constant casting
+================
+
+A subset of :ref:`values <lang-values>` are *constant-castable*. If a value is constant-castable and all of its operands are also constant-castable, it can be converted to a :class:`Const`, the numeric value of which can then be read by Python code. This provides a way to perform computation on Amaranth values while constructing the design.
+
+.. TODO: link to m.Case and v.matches() below
+
+Constant-castable objects are accepted anywhere a constant integer is accepted. Casting to a constant can also be done explicitly with :meth:`Const.cast`:
+
+.. doctest::
+
+   >>> Const.cast(Cat(C(10, 4), C(1, 2)))
+   (const 6'd26)
+
+They may be used in enumeration members, provided the enumeration inherits from :class:`amaranth.lib.enum.Enum`:
+
+.. testcode::
+
+   class Funct(amaranth.lib.enum.Enum, shape=4):
+       ADD = 0
+       ...
+
+   class Op(amaranth.lib.enum.Enum, shape=1):
+       REG = 0
+       IMM = 1
+
+   class Instr(amaranth.lib.enum.Enum, shape=5):
+       ADD  = Cat(Funct.ADD, Op.REG)
+       ADDI = Cat(Funct.ADD, Op.IMM)
+       ...
+
+.. note::
+
+   At the moment, only the following expressions are constant-castable:
+
+   * :class:`Const`
+   * :class:`Cat`
+
+   This list will be expanded in the future.
+
 
 .. _lang-signals:
 
@@ -354,6 +412,14 @@ Signals assigned in a :ref:`combinatorial <lang-comb>` domain are not affected b
    False
    >>> Signal(reset_less=True).reset_less
    True
+
+
+.. _lang-data:
+
+Data structures
+===============
+
+Amaranth provides aggregate data structures in the standard library module :mod:`amaranth.lib.data`.
 
 
 .. _lang-operators:
@@ -644,7 +710,7 @@ Operation               Description                                      Notes
 
 .. [#opS1] Words "length" and "width" have the same meaning when talking about Amaranth values. Conventionally, "width" is used.
 .. [#opS2] All variations of the Python slice notation are supported, including "extended slicing". E.g. all of ``a[0]``, ``a[1:9]``, ``a[2:]``, ``a[:-2]``, ``a[::-1]``, ``a[0:8:2]`` select bits in the same way as other Python sequence types select their elements.
-.. [#opS3] In the concatenated value, ``a`` occupies the least significant bits, and ``b`` the most significant bits.
+.. [#opS3] In the concatenated value, ``a`` occupies the least significant bits, and ``b`` the most significant bits. Any number of arguments (zero, one, two, or more) are supported.
 
 For the operators introduced by Amaranth, the following table explains them in terms of Python code operating on tuples of bits rather than Amaranth values:
 
@@ -800,7 +866,7 @@ Every signal included in the target of an assignment becomes a part of the domai
 
    Clearly, Amaranth code that drives a single bit of a signal from two different domains does not describe a meaningful circuit. However, driving two different bits of a signal from two different domains does not inherently cause such a conflict. Would Amaranth accept the following code?
 
-   .. testcode::
+   .. code-block::
 
       e = Signal(2)
       m.d.comb += e[0].eq(0)
@@ -945,6 +1011,7 @@ Signals in the combinatorial :ref:`control domain <lang-domains>` change wheneve
 Consider the following code:
 
 .. testsetup::
+
    en = Signal()
    b = Signal(8)
 
